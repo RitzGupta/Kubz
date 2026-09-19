@@ -1,0 +1,50 @@
+name: Build and push to ECR
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: kubz
+  AWS_ROLE_ARN: arn:aws:iam::147956724891:role/github-actions-kubz-ecr-push
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t "$ECR_REPOSITORY:${{ github.sha }}" .
+
+      # PRs only build, to verify the Dockerfile - no AWS creds, nothing pushed.
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: github.event_name != 'pull_request'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and push
+        if: github.event_name != 'pull_request'
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          IMAGE="$REGISTRY/$ECR_REPOSITORY"
+          docker tag "$ECR_REPOSITORY:${{ github.sha }}" "$IMAGE:${{ github.sha }}"
+          docker tag "$ECR_REPOSITORY:${{ github.sha }}" "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
