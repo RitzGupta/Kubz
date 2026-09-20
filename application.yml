@@ -1,0 +1,94 @@
+# porter-lite app spec, v1 — https://github.com/RitzGupta/Kubz
+#
+# This repo holds two apps. Each declares where its code lives and how it runs.
+# Cluster and namespace are chosen at deploy time, not here.
+
+version: v1
+
+apps:
+  # The cat-gif app. Serves "/" only, so probes point there.
+  - name: app-1
+    kind: web
+
+    build:
+      context: ./app-1
+      dockerfile: Dockerfile
+
+    runtime:
+      port: 5000
+      health:
+        liveness: /
+        readiness: /
+      resources:
+        cpu: 100m
+        memory: 128Mi
+
+    expose:
+      type: external
+      path: /
+
+    env:
+      - name: APP_NAME
+        value: app-1
+
+    # Which environment this deploys as: dev | qa | stage | prod.
+    environment: dev
+
+    # Replicas and autoscaling, per environment.
+    environments:
+      dev:
+        replicas: 1
+      qa:
+        replicas: 2
+      stage:
+        replicas: 2
+      prod:
+        replicas: 3
+
+  # Second app: real /health and /ready endpoints and a different port, which
+  # is what makes it a useful test of per-app configuration.
+  - name: app-2
+    kind: web
+
+    build:
+      context: ./app-2
+      dockerfile: Dockerfile
+
+    runtime:
+      port: 8080
+      health:
+        liveness: /health
+        readiness: /ready
+      resources:
+        cpu: 100m
+        memory: 128Mi
+
+    expose:
+      type: external
+      path: /
+
+    env:
+      - name: APP_NAME
+        value: app-2
+      - name: GREETING
+        value: Hello from app-2
+
+    environment: dev
+
+    environments:
+      dev:
+        replicas: 1
+      qa:
+        replicas: 2
+      stage:
+        replicas: 2
+        autoscaling:
+          min: 2
+          max: 6
+          cpu: 70
+      prod:
+        replicas: 3
+        autoscaling:
+          min: 3
+          max: 12
+          cpu: 70

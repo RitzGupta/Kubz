@@ -1,15 +1,17 @@
 name: Build and push to ECR
 
+# Manual dispatch only - porter-lite triggers this from the UI. Nothing builds
+# on push, so a commit is built exactly once, when you ask for it.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      app:
+        description: "Single app to build (blank = every app in application.yml)"
+        required: false
+        default: ""
 
 env:
   AWS_REGION: ap-south-1
-  ECR_REPOSITORY: kubz
   AWS_ROLE_ARN: arn:aws:iam::147956724891:role/github-actions-kubz-ecr-push
 
 permissions:
@@ -17,42 +19,83 @@ permissions:
   id-token: write
 
 jobs:
-  build:
+  # The app list comes from application.yml so the workflow cannot drift from
+  # the spec porter-lite deploys.
+  plan:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.apps.outputs.matrix }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Build image
-        run: docker build -t "$ECR_REPOSITORY:${{ github.sha }}" .
+      - name: Read apps from application.yml
+        id: apps
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, yaml
 
-      # PRs only build, to verify the Dockerfile - no AWS creds, nothing pushed.
+          spec = yaml.safe_load(open("application.yml"))
+          only = os.environ.get("ONLY", "").strip()
+
+          apps = [
+              {
+                  "name": a["name"],
+                  "context": a.get("build", {}).get("context", "."),
+                  "dockerfile": a.get("build", {}).get("dockerfile", "Dockerfile"),
+              }
+              for a in spec["apps"]
+              if not only or a["name"] == only
+          ]
+          if not only and not apps:
+              raise SystemExit("application.yml declares no apps")
+          if only and not apps:
+              raise SystemExit(f"no app named {only!r} in application.yml")
+
+          print("matrix=" + json.dumps({"include": apps}))
+          PY
+        env:
+          ONLY: ${{ inputs.app }}
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false          # one broken app must not hide the others
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ${{ matrix.name }}
+        run: |
+          docker build \
+            -t "${{ matrix.name }}:${{ github.sha }}" \
+            -f "${{ matrix.context }}/${{ matrix.dockerfile }}" \
+            "${{ matrix.context }}"
+
       - name: Configure AWS credentials
-        if: github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to ECR
-        if: github.event_name != 'pull_request'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # The ECR repo has immutable tags, so a commit can only be pushed once.
-      # Re-running a build on an unchanged commit is normal (manual dispatch,
-      # re-run failed job), so treat an already-present image as success.
-      - name: Tag and push
-        if: github.event_name != 'pull_request'
+      # Each app has its own ECR repository, named after the app. Tags are
+      # immutable, so a commit can only be pushed once - treat an image that is
+      # already there as success, since re-running a build is normal.
+      - name: Tag and push ${{ matrix.name }}
         run: |
           REGISTRY="${{ steps.login-ecr.outputs.registry }}"
-          IMAGE="$REGISTRY/$ECR_REPOSITORY"
+          REPO="${{ matrix.name }}"
           SHA="${{ github.sha }}"
+          IMAGE="$REGISTRY/$REPO"
 
           # batch-get-image, not describe-images: the CI role is only granted
           # ecr:BatchGetImage. It exits 0 either way, so compare the output.
           FOUND=$(aws ecr batch-get-image \
-                    --repository-name "$ECR_REPOSITORY" \
+                    --repository-name "$REPO" \
                     --image-ids imageTag="$SHA" \
                     --region "$AWS_REGION" \
                     --query 'images[0].imageId.imageTag' \
@@ -63,6 +106,6 @@ jobs:
             exit 0
           fi
 
-          docker tag "$ECR_REPOSITORY:$SHA" "$IMAGE:$SHA"
+          docker tag "$REPO:$SHA" "$IMAGE:$SHA"
           docker push "$IMAGE:$SHA"
           echo "pushed $IMAGE:$SHA"

@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+  <head>
+    <title>{{ name }}</title>
+    <style>
+      body { background: #12141c; color: #e7eaf3; font-family: system-ui, sans-serif; }
+      .box { max-width: 520px; margin: 120px auto; border: 1px solid #2a2f42;
+             border-radius: 12px; padding: 2rem; text-align: center; }
+      h1 { margin: 0 0 0.4rem; letter-spacing: -0.02em; }
+      code { color: #8ea2ff; }
+    </style>
+  </head>
+  <body>
+    <div class="box">
+      <h1>{{ greeting }}</h1>
+      <p>served by <code>{{ host }}</code></p>
+      <p><code>/health</code> · <code>/ready</code></p>
+    </div>
+  </body>
+</html>
