@@ -39,11 +39,30 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      # The ECR repo has immutable tags, so a commit can only be pushed once.
+      # Re-running a build on an unchanged commit is normal (manual dispatch,
+      # re-run failed job), so treat an already-present image as success.
       - name: Tag and push
         if: github.event_name != 'pull_request'
         run: |
           REGISTRY="${{ steps.login-ecr.outputs.registry }}"
           IMAGE="$REGISTRY/$ECR_REPOSITORY"
-          docker tag "$ECR_REPOSITORY:${{ github.sha }}" "$IMAGE:${{ github.sha }}"
-          docker push "$IMAGE:${{ github.sha }}"
-          echo "pushed $IMAGE:${{ github.sha }}"
+          SHA="${{ github.sha }}"
+
+          # batch-get-image, not describe-images: the CI role is only granted
+          # ecr:BatchGetImage. It exits 0 either way, so compare the output.
+          FOUND=$(aws ecr batch-get-image \
+                    --repository-name "$ECR_REPOSITORY" \
+                    --image-ids imageTag="$SHA" \
+                    --region "$AWS_REGION" \
+                    --query 'images[0].imageId.imageTag' \
+                    --output text 2>/dev/null || true)
+
+          if [ "$FOUND" = "$SHA" ]; then
+            echo "$IMAGE:$SHA is already in ECR - nothing to push"
+            exit 0
+          fi
+
+          docker tag "$ECR_REPOSITORY:$SHA" "$IMAGE:$SHA"
+          docker push "$IMAGE:$SHA"
+          echo "pushed $IMAGE:$SHA"
