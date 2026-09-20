@@ -6,9 +6,15 @@ on:
   workflow_dispatch:
     inputs:
       app:
-        description: "Single app to build (blank = every app in application.yml)"
+        description: "App to build (blank = every app in application.yml)"
         required: false
         default: ""
+      environment:
+        description: "Environment the image is built for"
+        required: false
+        default: dev
+        type: choice
+        options: [dev, qa, stage, prod]
 
 env:
   AWS_REGION: ap-south-1
@@ -65,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build ${{ matrix.name }}
+      - name: Build ${{ matrix.name }} (${{ inputs.environment }})
         run: |
           docker build \
             -t "${{ matrix.name }}:${{ github.sha }}" \
@@ -82,18 +88,31 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Each app has its own ECR repository, named after the app. Tags are
+      # One ECR repository per app AND environment: "<app>-<environment>".
+      # porter-lite creates it before dispatching this build. Tags are
       # immutable, so a commit can only be pushed once - treat an image that is
       # already there as success, since re-running a build is normal.
       - name: Tag and push ${{ matrix.name }}
         run: |
           REGISTRY="${{ steps.login-ecr.outputs.registry }}"
-          REPO="${{ matrix.name }}"
+          REPO="${{ matrix.name }}-${{ inputs.environment }}"
           SHA="${{ github.sha }}"
           IMAGE="$REGISTRY/$REPO"
+          LOCAL="${{ matrix.name }}:$SHA"   # what the build step tagged
 
-          # batch-get-image, not describe-images: the CI role is only granted
-          # ecr:BatchGetImage. It exits 0 either way, so compare the output.
+          # Create the repository if it is missing, so a build never fails with
+          # "repository does not exist". Immutable tags: a commit is pushed once.
+          if ! aws ecr describe-repositories --repository-names "$REPO" \
+                 --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "creating ECR repository $REPO"
+            aws ecr create-repository \
+              --repository-name "$REPO" \
+              --image-tag-mutability IMMUTABLE \
+              --region "$AWS_REGION" >/dev/null
+          fi
+
+          # batch-get-image, not describe-images: the CI role is not granted
+          # ecr:DescribeImages. It exits 0 either way, so compare the output.
           FOUND=$(aws ecr batch-get-image \
                     --repository-name "$REPO" \
                     --image-ids imageTag="$SHA" \
@@ -106,6 +125,6 @@ jobs:
             exit 0
           fi
 
-          docker tag "$REPO:$SHA" "$IMAGE:$SHA"
+          docker tag "$LOCAL" "$IMAGE:$SHA"
           docker push "$IMAGE:$SHA"
           echo "pushed $IMAGE:$SHA"
