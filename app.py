@@ -4,6 +4,7 @@ import random
 
 app = Flask(__name__)
 
+
 # list of cat images
 images = [
     "https://firebasestorage.googleapis.com/v0/b/docker-curriculum.appspot.com/o/catnip%2F0.gif?alt=media&token=0fff4b31-b3d8-44fb-be39-723f040e57fb",
