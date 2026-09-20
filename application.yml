@@ -7,7 +7,7 @@ version: v1
 
 apps:
   # The cat-gif app. Serves "/" only, so probes point there.
-  - name: app-1
+  - name: Nihu
     kind: web
 
     build:
@@ -47,7 +47,7 @@ apps:
 
   # Second app: real /health and /ready endpoints and a different port, which
   # is what makes it a useful test of per-app configuration.
-  - name: app-2
+  - name: Ritik
     kind: web
 
     build:
