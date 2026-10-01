@@ -1,0 +1,242 @@
+# porter-lite security scan
+#
+# Dispatched by porter-lite after a build, on demand, and daily for running
+# images. Runs on self-hosted runners inside your own cluster, and reports to
+# your own SonarQube and DefectDojo there: neither your code nor your findings
+# leave your infrastructure.
+#
+# Recommend, never gate: no step fails the run on a finding. What to fix, and
+# when, is the code owner's call.
+#
+# Opengrep rules: by default this fetches github.com/opengrep/opengrep-rules,
+# which is LGPL-2.1 with the Commons Clause. To use your own rules, set the repo
+# variable OPENGREP_RULES to a git URL, or to a path inside this repo.
+
+name: porter-lite security
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "repo (code, dependencies, IaC, secrets) or image (running images)"
+        default: repo
+      runner:
+        description: "Runner label of the in-cluster scan runners"
+        required: true
+      app:
+        description: "App name from application.yml"
+        required: true
+      sha:
+        description: "Commit to scan (repo mode). Empty = the dispatched ref."
+        default: ""
+      images:
+        description: "Space-separated image references (image mode)"
+        default: ""
+
+run-name: "security · ${{ inputs.app }} · ${{ inputs.mode }}"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: porter-lite-security-${{ inputs.app }}-${{ inputs.mode }}
+  cancel-in-progress: false
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  TRIVY_VERSION: "0.75.0"
+  OPENGREP_VERSION: "1.30.0"
+  OPENGREP_RULES: ${{ vars.OPENGREP_RULES || 'https://github.com/opengrep/opengrep-rules' }}
+  PRODUCT: ${{ github.repository }}:${{ inputs.app }}
+  REPORTS: ${{ github.workspace }}/.porter-security
+
+jobs:
+  scan:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
+
+      - name: Prepare
+        id: prep
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORTS" "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if ! command -v jq >/dev/null || ! python3 -c 'import yaml' 2>/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq jq python3-yaml >/dev/null
+          fi
+          # The app's build context, so scans cover what this app is built from.
+          context=$(python3 - <<'EOF'
+          import os, yaml
+          try:
+              spec = yaml.safe_load(open("application.yml")) or {}
+          except FileNotFoundError:
+              spec = {}
+          for a in spec.get("apps") or []:
+              if a.get("name") == os.environ["APP"]:
+                  print(((a.get("build") or {}).get("context") or ".").strip())
+                  break
+          else:
+              print(".")
+          EOF
+          )
+          echo "context=$context" >> "$GITHUB_OUTPUT"
+          echo "branch=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          key=$(echo "${GITHUB_REPOSITORY}_${APP}" | tr -c 'A-Za-z0-9_.\n-' '_')
+          echo "sonar_key=$key" >> "$GITHUB_OUTPUT"
+        env:
+          APP: ${{ inputs.app }}
+
+      - name: Install scanners
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" | tar -xz trivy
+          curl -sSfL -o opengrep "https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}/opengrep_manylinux_x86"
+          chmod +x gitleaks trivy opengrep
+          mv gitleaks trivy opengrep "$HOME/.local/bin/"
+
+      # ---------------- repo mode ----------------
+
+      - name: Gitleaks (secrets)
+        if: inputs.mode == 'repo'
+        continue-on-error: true
+        # --redact: the report names where a secret is, never the secret itself.
+        run: gitleaks dir . --redact --no-banner --exit-code 0 --report-format json --report-path "$REPORTS/gitleaks.json"
+
+      - name: Opengrep (SAST)
+        if: inputs.mode == 'repo'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          configs=(--config "$OPENGREP_RULES")
+          if [[ "$OPENGREP_RULES" == http* || "$OPENGREP_RULES" == git@* ]]; then
+            git clone --depth 1 -q "$OPENGREP_RULES" "$RUNNER_TEMP/rules"
+            configs=()
+            # Language directories only: the repo root also holds templates,
+            # tooling config and YAML test targets that do not load as rules.
+            for d in bash c csharp dockerfile elixir go html java javascript kotlin \
+                     ocaml php python ruby rust scala solidity swift terraform typescript; do
+              [ -d "$RUNNER_TEMP/rules/$d" ] && configs+=(--config "$RUNNER_TEMP/rules/$d")
+            done
+          fi
+          opengrep scan "${configs[@]}" --sarif --output "$REPORTS/opengrep.sarif" \
+            --metrics off --quiet "${{ steps.prep.outputs.context }}" || true
+
+      - name: Trivy (dependencies and IaC)
+        if: inputs.mode == 'repo'
+        continue-on-error: true
+        run: |
+          trivy fs --scanners vuln --format json --output "$REPORTS/trivy-fs.json" \
+            --exit-code 0 --quiet "${{ steps.prep.outputs.context }}"
+          trivy config --format json --output "$REPORTS/trivy-config.json" \
+            --exit-code 0 --quiet .
+
+      - name: SonarQube (quality and SAST)
+        if: inputs.mode == 'repo'
+        continue-on-error: true
+        uses: SonarSource/sonarqube-scan-action@v8.3.0
+        with:
+          projectBaseDir: ${{ steps.prep.outputs.context }}
+          args: >
+            -Dsonar.projectKey=${{ steps.prep.outputs.sonar_key }}
+            -Dsonar.projectName=${{ env.PRODUCT }}
+            -Dsonar.scm.revision=${{ steps.prep.outputs.commit }}
+
+      # ---------------- image mode ----------------
+
+      - name: Trivy (running images)
+        if: inputs.mode == 'image'
+        continue-on-error: true
+        # ECR credentials come from the runner's Pod Identity role.
+        run: |
+          i=0
+          for image in ${{ inputs.images }}; do
+            i=$((i + 1))
+            trivy image --format json --output "$REPORTS/trivy-image-$i.json" \
+              --exit-code 0 --quiet "$image" || echo "::warning::could not scan $image"
+          done
+
+      # ---------------- report ----------------
+
+      - name: Send to DefectDojo
+        if: always()
+        continue-on-error: true
+        env:
+          MODE: ${{ inputs.mode }}
+          BRANCH: ${{ steps.prep.outputs.branch }}
+          COMMIT: ${{ steps.prep.outputs.commit }}
+          SONAR_KEY: ${{ steps.prep.outputs.sonar_key }}
+          CONTEXT: ${{ steps.prep.outputs.context }}
+        run: |
+          set -uo pipefail
+          api="$DEFECTDOJO_URL/api/v2"
+          auth="Authorization: Token $DEFECTDOJO_TOKEN"
+          if [ "$MODE" = image ]; then engagement="images"; else engagement="branch:$BRANCH"; fi
+
+          # reimport: one test per tool, updated in place each run; findings
+          # gone from the new report are closed rather than piling up.
+          reimport() {   # scan_type test_title file
+            [ -s "$3" ] || { echo "skip $2: no report"; return; }
+            code=$(curl -sS -o "$RUNNER_TEMP/dd.out" -w '%{http_code}' -X POST "$api/reimport-scan/" -H "$auth" \
+              -F "scan_type=$1" -F "test_title=$2" -F "file=@$3" \
+              -F "product_type_name=porter-lite" -F "product_name=$PRODUCT" \
+              -F "engagement_name=$engagement" -F "auto_create_context=true" \
+              -F "close_old_findings=true" -F "deduplication_on_engagement=true" \
+              -F "commit_hash=$COMMIT" -F "branch_tag=$BRANCH" -F "minimum_severity=Info")
+            echo "$2 -> HTTP $code"
+            [ "${code:0:1}" = 2 ] || head -c 500 "$RUNNER_TEMP/dd.out"
+          }
+
+          if [ "$MODE" = repo ]; then
+            reimport "Gitleaks Scan" "Gitleaks" "$REPORTS/gitleaks.json"
+            reimport "SARIF" "Opengrep" "$REPORTS/opengrep.sarif"
+            reimport "Trivy Scan" "Trivy dependencies" "$REPORTS/trivy-fs.json"
+            reimport "Trivy Scan" "Trivy IaC" "$REPORTS/trivy-config.json"
+          else
+            for f in "$REPORTS"/trivy-image-*.json; do
+              reimport "Trivy Scan" "Trivy $(jq -r .ArtifactName "$f")" "$f"
+            done
+          fi
+
+          # SonarQube issues reach DefectDojo through its SonarQube API importer,
+          # once the server has finished processing this analysis.
+          task="$CONTEXT/.scannerwork/report-task.txt"
+          if [ "$MODE" = repo ] && [ -f "$task" ]; then
+            url=$(grep '^ceTaskUrl=' "$task" | cut -d= -f2-)
+            for _ in $(seq 60); do
+              status=$(curl -sS -u "$SONAR_TOKEN:" "$url" | jq -r .task.status)
+              case "$status" in SUCCESS|FAILED|CANCELED) break ;; esac
+              sleep 5
+            done
+            echo "SonarQube analysis: $status"
+            pid=$(curl -sS -G "$api/products/" -H "$auth" --data-urlencode "name=$PRODUCT" | jq -r '.results[0].id // empty')
+            if [ "$status" = SUCCESS ] && [ -n "$pid" ]; then
+              cfg=$(curl -sS -G "$api/product_api_scan_configurations/" -H "$auth" \
+                --data-urlencode "product=$pid" --data-urlencode "service_key_1=$SONAR_KEY" | jq -r '.results[0].id // empty')
+              if [ -z "$cfg" ]; then
+                cfg=$(curl -sS -X POST "$api/product_api_scan_configurations/" -H "$auth" -H 'Content-Type: application/json' \
+                  -d "{\"product\": $pid, \"tool_configuration\": $DEFECTDOJO_SONAR_TOOL_CONFIG, \"service_key_1\": \"$SONAR_KEY\"}" | jq -r .id)
+              fi
+              code=$(curl -sS -o "$RUNNER_TEMP/dd.out" -w '%{http_code}' -X POST "$api/reimport-scan/" -H "$auth" \
+                -F "scan_type=SonarQube API Import" -F "test_title=SonarQube" -F "api_scan_configuration=$cfg" \
+                -F "product_name=$PRODUCT" -F "engagement_name=$engagement" -F "auto_create_context=true" \
+                -F "close_old_findings=true" -F "commit_hash=$COMMIT" -F "branch_tag=$BRANCH")
+              echo "SonarQube -> HTTP $code"
+              [ "${code:0:1}" = 2 ] || head -c 500 "$RUNNER_TEMP/dd.out"
+            fi
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Security scan: ${{ inputs.app }} (${{ inputs.mode }})"
+            echo "Findings are in your DefectDojo, product \`$PRODUCT\`, and in porter-lite's Security page."
+            echo "This scan recommends only; nothing was blocked."
+          } >> "$GITHUB_STEP_SUMMARY"
